@@ -21,33 +21,52 @@ def _interocular_distance(landmarks: np.ndarray) -> float:
 def compute_displacement(
     source_lm: np.ndarray,
     driver_lm: np.ndarray,
-    driver_neutral_lm: np.ndarray,
+    driver_neutral_lm: np.ndarray = None,
     scale: float = 1.0
 ) -> np.ndarray:
     """
-    Compute expression displacement vectors from driver's neutral to expressive pose,
-    then rescale to match the source face's proportions.
+    Compute expression displacement vectors.
+
+    Two modes:
+    - With driver_neutral_lm (full mode): delta = driver_expressive - driver_neutral,
+      rescaled to match source face size. Best results, requires a neutral photo of driver.
+    - Without driver_neutral_lm (direct mode): directly warp source landmarks toward
+      driver landmark positions, scale-normalized. No neutral photo needed.
 
     Args:
         source_lm:         (68, 2) landmarks of the source (target) face
         driver_lm:         (68, 2) landmarks of the driver face (expressive)
-        driver_neutral_lm: (68, 2) landmarks of the driver face (neutral)
-        scale:             Optional manual scale multiplier (0.7–1.0 to reduce exaggeration)
+        driver_neutral_lm: (68, 2) optional — driver neutral baseline
+        scale:             multiplier (0.7–1.0 to reduce exaggeration, try 0.7 first)
 
     Returns:
         displacement: (68, 2) float32 array of (dx, dy) vectors
     """
-    # Raw expression delta on driver face
-    raw_delta = driver_lm - driver_neutral_lm  # (68, 2)
-
-    # Normalize by driver's face scale, re-apply at source's face scale
-    driver_scale = _interocular_distance(driver_neutral_lm)
     source_scale = _interocular_distance(source_lm)
 
-    if driver_scale < 1e-6:
-        raise ValueError("Driver neutral landmarks degenerate — interocular distance near zero.")
+    if driver_neutral_lm is not None:
+        # Full mode: delta from neutral to expressive
+        raw_delta = driver_lm - driver_neutral_lm
+        driver_scale = _interocular_distance(driver_neutral_lm)
+        if driver_scale < 1e-6:
+            raise ValueError("Driver neutral landmarks degenerate — interocular distance near zero.")
+        displacement = raw_delta * (source_scale / driver_scale) * scale
+    else:
+        # Direct mode: align driver landmarks onto source face space,
+        # then displace source landmarks toward the aligned driver positions
+        driver_scale = _interocular_distance(driver_lm)
+        if driver_scale < 1e-6:
+            raise ValueError("Driver landmarks degenerate — interocular distance near zero.")
 
-    displacement = raw_delta * (source_scale / driver_scale) * scale
+        # Align driver landmarks to source: match scale and center
+        source_center = source_lm.mean(axis=0)
+        driver_center = driver_lm.mean(axis=0)
+        ratio = source_scale / driver_scale
+        driver_aligned = (driver_lm - driver_center) * ratio + source_center
+
+        # Displacement = how far each source landmark needs to move
+        displacement = (driver_aligned - source_lm) * scale
+
     return displacement.astype(np.float32)
 
 

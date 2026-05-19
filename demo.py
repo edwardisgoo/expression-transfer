@@ -27,20 +27,19 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=1.0, output_di
         print("Error: could not load one or both images.")
         sys.exit(1)
 
-    # If no neutral driver provided, use driver image itself (identity — no transfer)
     if driver_neutral_path:
         driver_neutral_img = cv2.imread(driver_neutral_path)
     else:
-        print("[!] No driver neutral provided — using driver image as its own neutral baseline.")
-        print("    For best results, provide a neutral photo of the driver with --driver-neutral.")
-        driver_neutral_img = driver_img
+        print("[!] No driver neutral provided — using direct warp mode.")
+        print("    Source landmarks will be warped directly toward driver face geometry.")
+        driver_neutral_img = None
 
     print("[2/4] Detecting landmarks...")
     source_lm = detect_landmarks(source_img)
     driver_lm = detect_landmarks(driver_img)
-    driver_neutral_lm = detect_landmarks(driver_neutral_img)
+    driver_neutral_lm = detect_landmarks(driver_neutral_img) if driver_neutral_img is not None else None
 
-    if any(lm is None for lm in [source_lm, driver_lm, driver_neutral_lm]):
+    if any(lm is None for lm in [source_lm, driver_lm]):
         print("Error: landmark detection failed on one or more images.")
         sys.exit(1)
 
@@ -69,7 +68,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", required=True, help="Source face image (neutral)")
     parser.add_argument("--driver", required=True, help="Driver face image (expressive)")
     parser.add_argument("--driver-neutral", default=None, help="Driver neutral baseline image")
-    parser.add_argument("--scale", type=float, default=1.0, help="Expression scale factor (0.7-1.0)")
+    parser.add_argument("--scale", type=float, default=0.7, help="Expression scale factor (0.5–1.0)")
     parser.add_argument("--output", default="output", help="Output directory")
     args = parser.parse_args()
 
