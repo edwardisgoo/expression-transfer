@@ -1,8 +1,5 @@
 opencv-python>=4.8.0
-<<<<<<< HEAD
 dlib-bin>=19.24.0
-=======
->>>>>>> c8403837efbd5115cb6bfd5bc9883eb95798c94a
 numpy>=1.24.0
 scipy>=1.11.0
 scikit-image>=0.21.0
