@@ -6,3 +6,4 @@ scikit-image>=0.21.0
 matplotlib>=3.7.0
 # optional but improves triangle rasterization robustness
 shapely>=2.0.3; python_version>='3.9'  # not strictly required
+mediapipe>=0.10.14

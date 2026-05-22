@@ -9,14 +9,15 @@ import numpy as np
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+# Make repo root importable, so we can import src.* as a package
+sys.path.insert(0, os.path.dirname(__file__))
 
-from landmark import detect_landmarks
-from expression import compute_displacement, apply_displacement
-from warp import warp_face
-from blend import blend, save_comparison
-from align import align_face
-from evaluate import compute_metrics, print_metrics, save_metrics_json
+from src.landmark import detect_landmarks
+from src.expression import compute_displacement, apply_displacement
+from src.warp import warp_face
+from src.blend import blend, save_comparison
+from src.align import align_face
+from src.evaluate import compute_metrics, print_metrics, save_metrics_json
 
 
 def _transform_landmarks(lm: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -65,20 +66,64 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=1.0, output_di
     print("[4/5] Computing displacement & warping in aligned space...")
     displacement = compute_displacement(src_lm_aligned, drv_lm_aligned, drvN_lm_aligned, scale=scale)
 
-    # target_lm in aligned space → transform back to original space for ETR
+    # target_lm in aligned space
     target_lm_aligned = apply_displacement(src_lm_aligned, displacement)
-    target_lm_orig    = _transform_landmarks(target_lm_aligned, M_src_inv)
+
+    # For ETR, compute the target landmarks back in original space
+    target_lm_orig = _transform_landmarks(target_lm_aligned, M_src_inv)
 
     warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement)
+
+    # Region-aware compositing — mouth handled separately (avoid lip fill)
+    try:
+        from src.warp import warp_image_by_landmarks  # type: ignore
+        driver_to_target_aligned = warp_image_by_landmarks(drv_aligned, drv_lm_aligned, target_lm_aligned)
+
+        # Mouth masks (aligned space)
+        inner_poly = target_lm_aligned[60:68].astype(np.int32)
+        mouth_inner = np.zeros(face_mask_aligned.shape, dtype=np.uint8)
+        cv2.fillPoly(mouth_inner, [inner_poly], 255)
+        # Slightly erode inner so we don't overlap lip rim; keep outer in global mask
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mouth_inner_eroded = cv2.erode(mouth_inner, k3, iterations=1)
+
+        # Carve ONLY the inner mouth from the global face mask; keep outer lips warped
+        face_mask_aligned_nouth = face_mask_aligned.copy()
+        inv_inner = cv2.bitwise_not(mouth_inner_eroded)
+        face_mask_aligned_nouth = cv2.bitwise_and(face_mask_aligned_nouth, inv_inner)
+
+    except Exception as e:
+        print(f"[demo] Mouth preprocessing error (non-fatal): {e}")
+        driver_to_target_aligned = None
+        face_mask_aligned_nouth = face_mask_aligned
+        mouth_inner = None
 
     h, w = source_img.shape[:2]
     warped_img = cv2.warpAffine(warped_aligned, M_src_inv, (w, h),
                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-    face_mask  = cv2.warpAffine(face_mask_aligned, M_src_inv, (w, h),
+    # Use face mask with mouth carved out for global blend
+    face_mask  = cv2.warpAffine(face_mask_aligned_nouth, M_src_inv, (w, h),
                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
 
     print("[5/5] Blending...")
-    result = blend(source_img, warped_img, face_mask)
+    base_result = blend(source_img, warped_img, face_mask)
+
+    # Second pass: paste driver mouth in original space
+    if driver_to_target_aligned is not None and mouth_inner is not None:
+        driver_to_target_orig = cv2.warpAffine(driver_to_target_aligned, M_src_inv, (w, h),
+                                               flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        mouth_mask_orig = cv2.warpAffine(mouth_inner, M_src_inv, (w, h),
+                                         flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        Mmouth = cv2.moments(mouth_mask_orig)
+        if Mmouth["m00"] > 0:
+            cx = int(Mmouth["m10"] / Mmouth["m00"])
+            cy = int(Mmouth["m01"] / Mmouth["m00"])
+            result = cv2.seamlessClone(driver_to_target_orig, base_result, mouth_mask_orig, (cx, cy), cv2.MIXED_CLONE)
+        else:
+            print("[demo] Warning: empty mouth mask in orig space; skipping mouth clone")
+            result = base_result
+    else:
+        result = base_result
 
     result_path     = os.path.join(output_dir, "result.jpg")
     comparison_path = os.path.join(output_dir, "comparison.jpg")

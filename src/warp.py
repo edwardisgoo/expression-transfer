@@ -116,6 +116,20 @@ def warp_face(
     return warped_img, face_mask
 
 
+def warp_image_by_landmarks(
+    image: np.ndarray,
+    src_lm: np.ndarray,
+    dst_lm: np.ndarray,
+) -> np.ndarray:
+    """
+    Warp image so that src_lm landmarks move to dst_lm positions.
+    Returns the warped image (same size, no mask).
+    """
+    displacement = (dst_lm - src_lm).astype(np.float32)
+    warped, _ = warp_face(image, src_lm, displacement)
+    return warped
+
+
 if __name__ == "__main__":
     import sys
     # Quick sanity check with a blank image
