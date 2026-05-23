@@ -20,7 +20,7 @@ import numpy as np
 # Make repo root importable, so we can import src.* as a package
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.landmark import detect_landmarks, detect_blendshapes
+from src.landmark_config import get_config as _get_lm_config
 from src.expression import compute_displacement, apply_displacement
 from src.warp import warp_face
 from src.blend import blend, save_comparison
@@ -84,9 +84,33 @@ def _transform_landmarks(lm: np.ndarray, M: np.ndarray) -> np.ndarray:
     return (pts @ M.T).astype(np.float32)
 
 
+def _build_detector(landmark_mode: str):
+    """
+    Return (detect_fn, detect_bs_fn) for the requested landmark mode.
+
+    detect_fn     : image → (N, 2) ndarray or None
+    detect_bs_fn  : image → (52,) ndarray or None   (None for dlib mode)
+    """
+    if landmark_mode == "mp":
+        from src.landmark import detect_landmarks, detect_blendshapes
+        return detect_landmarks, detect_blendshapes
+    elif landmark_mode == "dlib":
+        from src.landmark_dlib import detect_landmarks as _det
+        return _det, None
+    else:
+        raise ValueError(
+            f"Unknown landmark mode {landmark_mode!r}. Choose 'mp' or 'dlib'."
+        )
+
+
 def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_dir="output",
-        run_eval=True, save_metrics=False):
+        run_eval=True, save_metrics=False, landmark_mode="mp"):
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── Landmark backend ──────────────────────────────────────────────────────
+    lm_cfg = _get_lm_config(landmark_mode)
+    detect_landmarks, detect_blendshapes = _build_detector(landmark_mode)
+    print(f"[landmark] mode = {landmark_mode}  ({lm_cfg['n_points']} points)")
 
     print("[1/5] Loading images...")
     source_img = _load_image(source_path)
@@ -109,23 +133,23 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
     source_lm = detect_landmarks(source_img)
     driver_lm = detect_landmarks(driver_img)
     driver_neutral_lm = detect_landmarks(driver_neutral_img) if driver_neutral_img is not None else None
-    driver_bs = detect_blendshapes(driver_img)
+    driver_bs = detect_blendshapes(driver_img) if detect_blendshapes is not None else None
 
     if any(lm is None for lm in [source_lm, driver_lm]):
         print("Error: landmark detection failed on one or more images.")
         sys.exit(1)
 
     print("[3/5] Face alignment (stabilization)...")
-    src_aligned, src_lm_aligned, M_src, M_src_inv = align_face(source_img, source_lm)
-    drv_aligned, drv_lm_aligned, _, _ = align_face(driver_img, driver_lm)
+    src_aligned, src_lm_aligned, M_src, M_src_inv = align_face(source_img, source_lm, lm_cfg=lm_cfg)
+    drv_aligned, drv_lm_aligned, _, _ = align_face(driver_img, driver_lm, lm_cfg=lm_cfg)
     if driver_neutral_img is not None and driver_neutral_lm is not None:
-        drvN_aligned, drvN_lm_aligned, _, _ = align_face(driver_neutral_img, driver_neutral_lm)
+        drvN_aligned, drvN_lm_aligned, _, _ = align_face(driver_neutral_img, driver_neutral_lm, lm_cfg=lm_cfg)
     else:
         drvN_aligned = None
         drvN_lm_aligned = None
 
     print("[4/5] Computing displacement & warping in aligned space...")
-    displacement = compute_displacement(src_lm_aligned, drv_lm_aligned, drvN_lm_aligned, scale=scale)
+    displacement = compute_displacement(src_lm_aligned, drv_lm_aligned, drvN_lm_aligned, scale=scale, lm_cfg=lm_cfg)
 
     # target_lm in aligned space
     target_lm_aligned = apply_displacement(src_lm_aligned, displacement)
@@ -140,9 +164,8 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
         from src.warp import warp_image_by_landmarks  # type: ignore
         driver_to_target_aligned = warp_image_by_landmarks(drv_aligned, drv_lm_aligned, target_lm_aligned)
 
-        # Mouth masks (aligned space) — MediaPipe inner-lip indices
-        _MP_INNER_LIP = [78, 191, 80, 13, 308, 402, 14, 88]
-        inner_poly = target_lm_aligned[_MP_INNER_LIP].astype(np.int32)
+        # Mouth masks (aligned space) — inner-lip indices from landmark config
+        inner_poly = target_lm_aligned[lm_cfg["inner_lip_idx"]].astype(np.int32)
         mouth_inner = np.zeros(face_mask_aligned.shape, dtype=np.uint8)
         cv2.fillPoly(mouth_inner, [inner_poly], 255)
         # Slightly erode inner so we don't overlap lip rim; keep outer in global mask
@@ -213,6 +236,7 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
             detect_fn          = detect_landmarks,
             driver_blendshapes = driver_bs,
             detect_bs_fn       = detect_blendshapes,
+            lm_cfg             = lm_cfg,
         )
         print_metrics(metrics)
 
@@ -231,10 +255,14 @@ if __name__ == "__main__":
     parser.add_argument("--driver-neutral", default=None,       help="Driver neutral baseline image")
     parser.add_argument("--scale",          type=float, default=0.7,
                         help="Expression scale factor (0.5–1.0)")
+    parser.add_argument("--landmark-mode",  default="mp", choices=["mp", "dlib"],
+                        help="Landmark backend: 'mp' = MediaPipe 478-pt (default), "
+                             "'dlib' = dlib 68-pt (lighter, legacy)")
     parser.add_argument("--output",         default="output",   help="Output directory")
     parser.add_argument("--no-eval",        action="store_true", help="Skip evaluation metrics")
     parser.add_argument("--save-metrics",   action="store_true", help="Save metrics.json to output dir")
     args = parser.parse_args()
 
     run(args.source, args.driver, args.driver_neutral, args.scale, args.output,
-        run_eval=not args.no_eval, save_metrics=args.save_metrics)
+        run_eval=not args.no_eval, save_metrics=args.save_metrics,
+        landmark_mode=args.landmark_mode)

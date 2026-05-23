@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Phase 2: Expression Parameterization
 Owner: Member A
@@ -19,56 +20,65 @@ Changes vs original:
       scale defaulted to a fixed float with no auto option.
     - Added _validate_landmarks() for early shape / NaN checks.
     - Warning printed when auto scale ≥ 1.8 (likely near pipeline ceiling).
+    - Added lm_cfg parameter to compute_displacement() so that the same code
+      can handle both MediaPipe 478-point and dlib 68-point landmarks.
 """
 
 import numpy as np
 
-# ── Landmark index ranges (MediaPipe 478-point model) ────────────────────────
-_LEFT_EYE  = [33, 160, 158, 133, 153, 144]
-_RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+# ── Default landmark index ranges (MediaPipe 478-point model) ─────────────────
+_LEFT_EYE_DEFAULT  = [33, 160, 158, 133, 153, 144]
+_RIGHT_EYE_DEFAULT = [362, 385, 387, 263, 373, 380]
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _eye_centers(landmarks: np.ndarray) -> tuple:
-    """Return (left_eye_center, right_eye_center) averaged over 6 pts each."""
-    return landmarks[_LEFT_EYE].mean(axis=0), landmarks[_RIGHT_EYE].mean(axis=0)
+def _eye_centers(landmarks: np.ndarray,
+                 left_eye: list | None  = None,
+                 right_eye: list | None = None) -> tuple:
+    """Return (left_eye_center, right_eye_center) averaged over the given pts."""
+    le = left_eye  if left_eye  is not None else _LEFT_EYE_DEFAULT
+    re = right_eye if right_eye is not None else _RIGHT_EYE_DEFAULT
+    return landmarks[le].mean(axis=0), landmarks[re].mean(axis=0)
 
 
-def _interocular_distance(landmarks: np.ndarray) -> float:
+def _interocular_distance(landmarks: np.ndarray,
+                          left_eye: list | None  = None,
+                          right_eye: list | None = None) -> float:
     """
     Inter-ocular distance based on mean eye-centre points.
 
-    Original used single outer-corner points (landmarks[36], landmarks[45]).
-    Averaging over all 6 eye points per side is more robust to detection noise.
+    Averaging over all 6 eye points per side is more robust to detection noise
+    than using a single outer-corner point.
     """
-    lc, rc = _eye_centers(landmarks)
+    lc, rc = _eye_centers(landmarks, left_eye, right_eye)
     return float(np.linalg.norm(rc - lc))
 
 
-def _align_landmarks(src: np.ndarray, ref: np.ndarray) -> np.ndarray:
+def _align_landmarks(src: np.ndarray,
+                     ref: np.ndarray,
+                     left_eye: list | None  = None,
+                     right_eye: list | None = None) -> np.ndarray:
     """
     Align src landmarks onto ref via scale + translation using eye anchors.
-
-    Original direct mode used lm.mean(axis=0) as the centre, which is biased
-    toward the lower face (jaw, chin have more points).  Eye-anchor alignment
-    is more stable and consistent with how align_face() works in demo.py.
 
     Only corrects scale + translation (NOT rotation) — rotation is already
     handled by align_face() before this function is called.
 
     Args:
-        src: (478, 2) landmarks to align
-        ref: (478, 2) reference landmarks
+        src:       (N, 2) landmarks to align
+        ref:       (N, 2) reference landmarks
+        left_eye:  list of left-eye landmark indices (defaults to MP478)
+        right_eye: list of right-eye landmark indices (defaults to MP478)
 
     Returns:
-        (478, 2) src landmarks rescaled and translated to ref space
+        (N, 2) src landmarks rescaled and translated to ref space
     """
-    src_lc, src_rc = _eye_centers(src)
-    ref_lc, ref_rc = _eye_centers(ref)
+    src_lc, src_rc = _eye_centers(src, left_eye, right_eye)
+    ref_lc, ref_rc = _eye_centers(ref, left_eye, right_eye)
 
-    src_iod    = np.linalg.norm(src_rc - src_lc) + 1e-8
-    ref_iod    = np.linalg.norm(ref_rc - ref_lc) + 1e-8
+    src_iod     = np.linalg.norm(src_rc - src_lc) + 1e-8
+    ref_iod     = np.linalg.norm(ref_rc - ref_lc) + 1e-8
     scale_ratio = ref_iod / src_iod
 
     src_center = (src_lc + src_rc) / 2.0
@@ -113,9 +123,11 @@ def _auto_scale(
     return float(np.clip(computed, min_scale, max_scale))
 
 
-def _validate_landmarks(lm: np.ndarray, name: str) -> None:
-    if lm.shape != (478, 2):
-        raise ValueError(f"{name}: expected shape (478, 2), got {lm.shape}")
+def _validate_landmarks(lm: np.ndarray, name: str, n_points: int = 478) -> None:
+    if lm.shape != (n_points, 2):
+        raise ValueError(
+            f"{name}: expected shape ({n_points}, 2), got {lm.shape}"
+        )
     if not np.isfinite(lm).all():
         raise ValueError(f"{name}: contains NaN or Inf values")
 
@@ -130,6 +142,7 @@ def compute_displacement(
     auto_scale_ratio: float = 0.35,
     auto_scale_min: float = 0.3,
     auto_scale_max: float = 2.5,
+    lm_cfg: dict | None = None,
 ) -> np.ndarray:
     """
     Compute expression displacement vectors.
@@ -145,9 +158,9 @@ def compute_displacement(
         No neutral photo needed; captures pose + expression together.
 
     Args:
-        source_lm:         (478, 2) landmarks of the source (target) face
-        driver_lm:         (478, 2) landmarks of the driver (expressive)
-        driver_neutral_lm: (478, 2) optional — driver neutral baseline
+        source_lm:         (N, 2) landmarks of the source (target) face
+        driver_lm:         (N, 2) landmarks of the driver (expressive)
+        driver_neutral_lm: (N, 2) optional — driver neutral baseline
         scale:             float to manually set expression strength, or
                            None (default) to auto-compute from displacement stats.
                            Typical range 0.5–1.5; auto usually lands in 1.0–2.0
@@ -155,16 +168,25 @@ def compute_displacement(
         auto_scale_ratio:  target P95 displacement as fraction of IOD (0.35).
         auto_scale_min:    auto-scale lower clamp (default 0.3).
         auto_scale_max:    auto-scale upper clamp (default 2.5).
+        lm_cfg:            Optional landmark-mode config dict from
+                           ``src.landmark_config.get_config()``.
+                           Keys used: ``n_points``, ``left_eye``, ``right_eye``.
+                           When None (default), MediaPipe 478-point layout is used.
 
     Returns:
-        displacement: (478, 2) float32 array of (dx, dy) vectors
+        displacement: (N, 2) float32 array of (dx, dy) vectors
     """
-    _validate_landmarks(source_lm,  "source_lm")
-    _validate_landmarks(driver_lm,  "driver_lm")
-    if driver_neutral_lm is not None:
-        _validate_landmarks(driver_neutral_lm, "driver_neutral_lm")
+    cfg       = lm_cfg or {}
+    n_pts     = cfg.get("n_points", 478)
+    left_eye  = cfg.get("left_eye",  None)
+    right_eye = cfg.get("right_eye", None)
 
-    source_iod = _interocular_distance(source_lm)
+    _validate_landmarks(source_lm,  "source_lm",  n_pts)
+    _validate_landmarks(driver_lm,  "driver_lm",  n_pts)
+    if driver_neutral_lm is not None:
+        _validate_landmarks(driver_neutral_lm, "driver_neutral_lm", n_pts)
+
+    source_iod = _interocular_distance(source_lm, left_eye, right_eye)
     if source_iod < 1e-6:
         raise ValueError("Source landmarks degenerate — interocular distance near zero.")
 
@@ -172,11 +194,12 @@ def compute_displacement(
         # ── Full mode ─────────────────────────────────────────────────────────
         # Align driver_neutral onto driver first so minor head movement between
         # the two shots does not contaminate the expression delta.
-        # Original: raw_delta = driver_lm - driver_neutral_lm  (no alignment)
-        driver_neutral_aligned = _align_landmarks(driver_neutral_lm, driver_lm)
+        driver_neutral_aligned = _align_landmarks(
+            driver_neutral_lm, driver_lm, left_eye, right_eye
+        )
         raw_delta = driver_lm - driver_neutral_aligned
 
-        driver_iod = _interocular_distance(driver_lm)
+        driver_iod = _interocular_distance(driver_lm, left_eye, right_eye)
         if driver_iod < 1e-6:
             raise ValueError("Driver landmarks degenerate — interocular distance near zero.")
 
@@ -186,7 +209,7 @@ def compute_displacement(
         # ── Direct mode ───────────────────────────────────────────────────────
         # align_face() in demo.py already removed rotation.
         # Use eye-anchor alignment (not mean-based) to map driver → source space.
-        driver_aligned   = _align_landmarks(driver_lm, source_lm)
+        driver_aligned   = _align_landmarks(driver_lm, source_lm, left_eye, right_eye)
         raw_displacement = driver_aligned - source_lm
 
     # ── Scale ─────────────────────────────────────────────────────────────────
@@ -218,34 +241,46 @@ def apply_displacement(landmarks: np.ndarray, displacement: np.ndarray) -> np.nd
     Use this for computing target_lm in demo.py (for ETR) or for debugging.
 
     Args:
-        landmarks:    (478, 2) source landmark positions
-        displacement: (478, 2) displacement vectors
+        landmarks:    (N, 2) source landmark positions
+        displacement: (N, 2) displacement vectors
 
     Returns:
-        new_landmarks: (478, 2) displaced landmark positions
+        new_landmarks: (N, 2) displaced landmark positions
     """
     return (landmarks + displacement).astype(np.float32)
 
 
 # ── Quick sanity check ────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    from src.landmark_config import get_config
     rng = np.random.default_rng(42)
 
+    # ── MediaPipe 478-point ───────────────────────────────────────────────────
+    cfg_mp = get_config("mp")
     src = rng.uniform(100, 300, (478, 2)).astype(np.float32)
-    # Give it a realistic eye layout so IOD is meaningful
-    src[33]  = [150, 200]; src[144] = [170, 200]   # left eye (MP indices)
-    src[362] = [210, 200]; src[263] = [230, 200]   # right eye (MP indices)
-
+    src[33]  = [150, 200]; src[144] = [170, 200]   # left eye
+    src[362] = [210, 200]; src[263] = [230, 200]   # right eye
     drv   = src + rng.uniform(-10, 10, (478, 2)).astype(np.float32)
     drv_n = src + rng.uniform(-2,   2, (478, 2)).astype(np.float32)
 
-    print("=== Full mode ===")
-    disp = compute_displacement(src, drv, drv_n)
+    print("=== MP478 — Full mode ===")
+    disp = compute_displacement(src, drv, drv_n, lm_cfg=cfg_mp)
     print(f"  shape={disp.shape}  max={np.abs(disp).max():.2f} px\n")
 
-    print("=== Direct mode (auto scale) ===")
-    disp2 = compute_displacement(src, drv)
+    print("=== MP478 — Direct mode (auto scale) ===")
+    disp2 = compute_displacement(src, drv, lm_cfg=cfg_mp)
     print(f"  shape={disp2.shape}  max={np.abs(disp2).max():.2f} px\n")
+
+    # ── dlib 68-point ─────────────────────────────────────────────────────────
+    cfg_dl = get_config("dlib")
+    src68 = rng.uniform(100, 300, (68, 2)).astype(np.float32)
+    src68[36] = [150, 200]; src68[41] = [170, 200]  # left eye
+    src68[42] = [210, 200]; src68[47] = [230, 200]  # right eye
+    drv68 = src68 + rng.uniform(-10, 10, (68, 2)).astype(np.float32)
+
+    print("=== DLIB68 — Direct mode ===")
+    disp3 = compute_displacement(src68, drv68, lm_cfg=cfg_dl)
+    print(f"  shape={disp3.shape}  max={np.abs(disp3).max():.2f} px\n")
 
     new_lm = apply_displacement(src, disp)
     print(f"apply_displacement → shape={new_lm.shape}")

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 evaluate.py — Expression Transfer Evaluation Metrics
 
@@ -55,7 +56,6 @@ Metrics
        head-tilt between result space (original) and driver_lm space (aligned).
 """
 
-from __future__ import annotations
 import json
 import numpy as np
 import cv2
@@ -131,13 +131,19 @@ def _color_drift(source: np.ndarray, result: np.ndarray, mask: np.ndarray) -> di
 _LEFT_EYE  = [33, 160, 158, 133, 153, 144]
 _RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-# Expression-relevant landmark groups (MediaPipe 478)
+# Expression-relevant landmark groups (MediaPipe 478 defaults)
 _BROW_IDX  = [70, 63, 105, 66, 107, 336, 296, 334, 293, 300]
 _MOUTH_IDX = [61, 40, 37, 0, 267, 270, 291, 321, 314, 17, 84, 91,
               78, 191, 80, 13, 308, 402, 14, 88]
 # Jaw/chin: stable, expression-independent — used for identity preservation
 _JAW_IDX   = [234, 93, 132, 58, 172, 136, 150, 149, 152,
               377, 400, 378, 379, 365, 397, 288, 454]
+# Expression-relevant subset used for ETR (brows + outer lips + inner lips)
+_EXPR_IDX  = (
+    _BROW_IDX
+    + [61, 40, 37, 0, 267, 270, 291, 321, 314, 17, 84, 91]   # outer lips
+    + [78, 191, 80, 13, 308, 402, 14, 88]                     # inner lips
+)  # 30 landmarks total
 
 # MediaPipe blendshape indices that correspond to visible expression AUs.
 # Index 0 (_neutral) is excluded; eye-gaze blendshapes are also excluded
@@ -160,9 +166,13 @@ _EXPR_BS_IDX = [
 ]
 
 
-def _eye_centers(lm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (left_eye_center, right_eye_center) averaged over 6 pts each."""
-    return lm[_LEFT_EYE].mean(axis=0), lm[_RIGHT_EYE].mean(axis=0)
+def _eye_centers(lm: np.ndarray,
+                 left_eye: list | None  = None,
+                 right_eye: list | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Return (left_eye_center, right_eye_center) averaged over the given pts."""
+    le = left_eye  if left_eye  is not None else _LEFT_EYE
+    re = right_eye if right_eye is not None else _RIGHT_EYE
+    return lm[le].mean(axis=0), lm[re].mean(axis=0)
 
 
 def _region_rmse(aligned_result: np.ndarray, ref_lm: np.ndarray, idx: list) -> float:
@@ -188,7 +198,10 @@ def _blendshape_similarity(bs_driver: np.ndarray, bs_result: np.ndarray) -> dict
     return {"cosine_sim": cosine, "mae": mae}
 
 
-def _align_lm_similarity(src_lm: np.ndarray, ref_lm: np.ndarray) -> np.ndarray:
+def _align_lm_similarity(src_lm: np.ndarray,
+                         ref_lm: np.ndarray,
+                         left_eye: list | None  = None,
+                         right_eye: list | None = None) -> np.ndarray:
     """
     Map src_lm into ref_lm's coordinate frame via similarity transform
     (scale + rotation + translation), anchored on eye-centre points.
@@ -198,8 +211,8 @@ def _align_lm_similarity(src_lm: np.ndarray, ref_lm: np.ndarray) -> np.ndarray:
     and driver_lm space (align_face-rotated).  Using only scale+translation
     (_align_lm_to_ref) would leave rotation error that inflates the RMSE.
     """
-    src_l, src_r = _eye_centers(src_lm)
-    ref_l, ref_r = _eye_centers(ref_lm)
+    src_l, src_r = _eye_centers(src_lm, left_eye, right_eye)
+    ref_l, ref_r = _eye_centers(ref_lm, left_eye, right_eye)
 
     src_vec  = src_r - src_l
     ref_vec  = ref_r - ref_l
@@ -233,6 +246,7 @@ def compute_metrics(
     detect_fn=None,
     driver_blendshapes: np.ndarray = None,
     detect_bs_fn=None,
+    lm_cfg: dict | None = None,
 ) -> dict:
     """
     Compute all evaluation metrics for one expression transfer result.
@@ -241,17 +255,29 @@ def compute_metrics(
         source_img: BGR source image (before transfer)
         result_img: BGR result image (after transfer)
         face_mask:  (H, W) uint8 mask — 255 = face region
-        source_lm:  (478, 2) source landmarks in ORIGINAL (unaligned) space
-        target_lm:  (478, 2) intended displaced landmarks in ORIGINAL space
+        source_lm:  (N, 2) source landmarks in ORIGINAL (unaligned) space
+        target_lm:  (N, 2) intended displaced landmarks in ORIGINAL space
                     (= source_lm + inv_transform(displacement), computed in demo.py)
-        driver_lm:  (478, 2) driver landmarks in ALIGNED space (drv_lm_aligned)
-        detect_fn:  callable(image) → (478, 2) or None.
+        driver_lm:  (N, 2) driver landmarks in ALIGNED space (drv_lm_aligned)
+        detect_fn:  callable(image) → (N, 2) or None.
                     Pass detect_landmarks from landmark.py to enable ETR + RMSE.
                     If None, both metrics are reported as None.
+        lm_cfg:     Optional landmark-mode config dict from
+                    ``src.landmark_config.get_config()``.
+                    Keys used: ``left_eye``, ``right_eye``, ``brow_idx``,
+                    ``mouth_idx``, ``jaw_idx``, ``expr_idx``.
+                    When None (default), MediaPipe 478-point indices are used.
 
     Returns:
         metrics: dict — keys listed in module docstring
     """
+    cfg       = lm_cfg or {}
+    left_eye  = cfg.get("left_eye",  None)   # None → _eye_centers uses _LEFT_EYE
+    right_eye = cfg.get("right_eye", None)
+    brow_idx  = cfg.get("brow_idx",  _BROW_IDX)
+    mouth_idx = cfg.get("mouth_idx", _MOUTH_IDX)
+    jaw_idx   = cfg.get("jaw_idx",   _JAW_IDX)
+    expr_idx  = cfg.get("expr_idx",  _EXPR_IDX)
     metrics: dict = {}
 
     # ── 1. SSIM full ─────────────────────────────────────────────────────────
@@ -276,15 +302,10 @@ def compute_metrics(
     metrics["ssim_background"] = _ssim_masked(source_img, result_img, bg_mask)
 
     # ── 6. ETR  ──────────────────────────────────────────────────────────────
-    # Only measure on expression-relevant landmarks (MediaPipe 478 indices):
-    #   eyebrows + mouth outer + mouth inner
+    # Only measure on expression-relevant landmarks (brows + mouth).
     # Jaw, nose, and cheeks barely move with expression; including them
     # shrinks the denominator and inflates ETR unpredictably.
-    _EXPR_IDX = (
-        [70, 63, 105, 66, 107, 336, 296, 334, 293, 300]          # brows
-        + [61, 40, 37, 0, 267, 270, 291, 321, 314, 17, 84, 91]   # outer lips
-        + [78, 191, 80, 13, 308, 402, 14, 88]                     # inner lips
-    )  # 30 landmarks total
+    # expr_idx comes from lm_cfg when provided, else module-level _EXPR_IDX.
 
     metrics["etr"]               = None
     metrics["lm_rmse_vs_driver"] = None
@@ -303,9 +324,9 @@ def compute_metrics(
         return metrics
 
     # ── 6. ETR ───────────────────────────────────────────────────────────────
-    sl = source_lm[_EXPR_IDX]
-    tl = target_lm[_EXPR_IDX]
-    rl = result_lm[_EXPR_IDX]
+    sl = source_lm[expr_idx]
+    tl = target_lm[expr_idx]
+    rl = result_lm[expr_idx]
     intended = np.linalg.norm(tl - sl, axis=1).mean()
     achieved = np.linalg.norm(rl - sl, axis=1).mean()
     if intended > 1e-6:
@@ -317,13 +338,13 @@ def compute_metrics(
     #   brow_rmse   — how well brow expression matches driver
     #   mouth_rmse  — how well mouth expression matches driver
     #   jaw_rmse    — how much non-expression geometry shifted (identity cost)
-    result_in_drv = _align_lm_similarity(result_lm, driver_lm)
+    result_in_drv = _align_lm_similarity(result_lm, driver_lm, left_eye, right_eye)
     metrics["lm_rmse_vs_driver"] = float(np.sqrt(np.mean(
         np.sum((result_in_drv - driver_lm) ** 2, axis=1)
     )))
-    metrics["brow_rmse"]  = _region_rmse(result_in_drv, driver_lm, _BROW_IDX)
-    metrics["mouth_rmse"] = _region_rmse(result_in_drv, driver_lm, _MOUTH_IDX)
-    metrics["jaw_rmse"]   = _region_rmse(result_in_drv, driver_lm, _JAW_IDX)
+    metrics["brow_rmse"]  = _region_rmse(result_in_drv, driver_lm, brow_idx)
+    metrics["mouth_rmse"] = _region_rmse(result_in_drv, driver_lm, mouth_idx)
+    metrics["jaw_rmse"]   = _region_rmse(result_in_drv, driver_lm, jaw_idx)
 
     # ── 10. Blendshape similarity ─────────────────────────────────────────────
     # Compare MediaPipe AU scores between driver and result.

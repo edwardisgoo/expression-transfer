@@ -94,8 +94,9 @@ def warp_face(
 
     Args:
         source_img:   BGR image (H, W, 3)
-        source_lm:    (68, 2) float32 landmark positions on source image
-        displacement: (68, 2) float32 displacement vectors from Phase 2
+        source_lm:    (N, 2) float32 landmark positions on source image
+                      (N = 478 for MediaPipe, 68 for dlib — any count works)
+        displacement: (N, 2) float32 displacement vectors from Phase 2
 
     Returns:
         warped_img: (H, W, 3) warped image
