@@ -515,6 +515,16 @@ def print_metrics(metrics: dict) -> None:
         print(f"  Blendshape cosine  : {cos:.3f}   ({cos_note})")
         print(f"  Blendshape MAE     : {mae:.3f}   ({mae_note})")
 
+    # ── LPIPS perceptual distance ─────────────────────────────────────────────
+    lpips_v = metrics.get("lpips_face")
+    if lpips_v is not None:
+        lpips_note = ("✓ natural" if lpips_v < 0.15
+                      else "moderate" if lpips_v < 0.30
+                      else "↑ perceptual distortion")
+        print(f"  LPIPS perceptual   : {lpips_v:.3f}   ({lpips_note})")
+    else:
+        print(f"  LPIPS perceptual   : N/A  (install lpips + torch to enable)")
+
     print(f"{sep}\n")
 
 
