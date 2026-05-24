@@ -67,6 +67,63 @@ except ImportError:
     _HAS_SKIMAGE = False
     print("[evaluate] Warning: scikit-image not found — SSIM will use OpenCV fallback.")
 
+# ── LPIPS (lazy-loaded on first use) ─────────────────────────────────────────
+_LPIPS_MODEL = None
+
+def _get_lpips_model():
+    """Lazy-initialise AlexNet LPIPS model (loads once, stays in memory)."""
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is None:
+        try:
+            import lpips
+            _LPIPS_MODEL = lpips.LPIPS(net="alex", verbose=False)
+            _LPIPS_MODEL.eval()
+        except Exception as e:
+            print(f"[evaluate] LPIPS not available ({e}); perceptual metric skipped.")
+            _LPIPS_MODEL = False   # sentinel: don't retry
+    return _LPIPS_MODEL if _LPIPS_MODEL is not False else None
+
+
+def _lpips_face(src: np.ndarray, res: np.ndarray, mask: np.ndarray) -> float | None:
+    """
+    Compute LPIPS perceptual distance between source and result, restricted
+    to the face bounding box.  Returns a float in [0, 1] (lower = more similar).
+    Returns None if LPIPS is unavailable.
+    """
+    model = _get_lpips_model()
+    if model is None:
+        return None
+
+    # ── Crop to face bounding box ──────────────────────────────────────────────
+    ys, xs = np.where(mask > 0)
+    if len(ys) == 0:
+        return None
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop_src = src[y0:y1, x0:x1]
+    crop_res = res[y0:y1, x0:x1]
+
+    # ── Resize to at least 64×64 (LPIPS minimum) ──────────────────────────────
+    h, w = crop_src.shape[:2]
+    side  = max(64, h, w)
+    crop_src = cv2.resize(crop_src, (side, side), interpolation=cv2.INTER_AREA)
+    crop_res = cv2.resize(crop_res, (side, side), interpolation=cv2.INTER_AREA)
+
+    # ── Convert BGR→RGB, HWC→CHW, uint8→float32 in [-1, 1] ───────────────────
+    try:
+        import torch
+        def _to_tensor(img_bgr):
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            t   = torch.from_numpy(rgb.astype(np.float32) / 127.5 - 1.0)
+            return t.permute(2, 0, 1).unsqueeze(0)          # (1, 3, H, W)
+
+        with torch.no_grad():
+            d = model(_to_tensor(crop_src), _to_tensor(crop_res))
+        return float(d.item())
+    except Exception as e:
+        print(f"[evaluate] LPIPS compute failed: {e}")
+        return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Internal helpers
@@ -300,6 +357,12 @@ def compute_metrics(
     dilated  = cv2.dilate(face_mask, dilate_k, iterations=1)
     bg_mask  = (dilated == 0).astype(np.uint8) * 255
     metrics["ssim_background"] = _ssim_masked(source_img, result_img, bg_mask)
+
+    # ── 5b. LPIPS (perceptual face quality) ──────────────────────────────────
+    # AlexNet-based perceptual distance on the face crop.
+    # 0 = identical, ~1 = very different.  Correlates better with human
+    # "looks natural" judgement than pixel-level SSIM/PSNR.
+    metrics["lpips_face"] = _lpips_face(source_img, result_img, face_mask)
 
     # ── 6. ETR  ──────────────────────────────────────────────────────────────
     # Only measure on expression-relevant landmarks (brows + mouth).
