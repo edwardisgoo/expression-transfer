@@ -112,6 +112,62 @@ def blend(
     return result
 
 
+def color_correct(
+    result: np.ndarray,
+    source: np.ndarray,
+    face_mask: np.ndarray,
+    strength: float = 0.85,
+) -> np.ndarray:
+    """
+    Histogram-match the result's face region to the source's colour
+    distribution, removing residual colour cast from warping and blending.
+
+    Works in LAB colour space so luminance and chroma are corrected
+    independently. The existing mean-shift in blend() handles gross offset;
+    this step corrects the full distribution shape (contours, gradients).
+
+    Args:
+        result:    BGR result image to correct
+        source:    BGR source image whose histogram is the target
+        face_mask: (H, W) uint8 mask — white = face region
+        strength:  blend between original (0) and fully corrected (1).
+                   Default 0.85 preserves most expression-driven colour.
+    """
+    if face_mask is None or not (face_mask > 0).any():
+        return result
+
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    res_lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB).astype(np.float32)
+    out_lab = res_lab.copy()
+
+    mask_bool = face_mask > 0
+
+    for ch in range(3):
+        src_px = src_lab[:, :, ch][mask_bool]
+        res_px = res_lab[:, :, ch][mask_bool]
+
+        src_hist, edges = np.histogram(src_px, bins=256, range=(0.0, 256.0))
+        res_hist, _     = np.histogram(res_px, bins=256, range=(0.0, 256.0))
+
+        src_cdf = src_hist.cumsum().astype(np.float64)
+        res_cdf = res_hist.cumsum().astype(np.float64)
+        src_cdf /= src_cdf[-1] + 1e-8
+        res_cdf /= res_cdf[-1] + 1e-8
+
+        bin_ctrs  = (edges[:-1] + edges[1:]) * 0.5
+        lut       = np.interp(res_cdf, src_cdf, bin_ctrs)
+        corrected = np.interp(res_lab[:, :, ch], bin_ctrs, lut).astype(np.float32)
+        out_lab[:, :, ch] = corrected
+
+    # Feather the mask with a large blur so the correction fades out well
+    # before the mask boundary — prevents a hard colour seam at the edge.
+    alpha_map = cv2.GaussianBlur(face_mask.astype(np.float32), (0, 0),
+                                  sigmaX=30, sigmaY=30)
+    alpha   = (alpha_map / 255.0 * strength)[:, :, None]
+    blended = np.clip(out_lab * alpha + res_lab * (1.0 - alpha), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(blended, cv2.COLOR_LAB2BGR)
+
+
 def save_comparison(source_img, driver_img, result_img, path="output/comparison.jpg"):
     """Save a side-by-side comparison of source | driver | result."""
     h = max(source_img.shape[0], driver_img.shape[0], result_img.shape[0])

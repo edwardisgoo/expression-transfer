@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.landmark_config import get_config as _get_lm_config
 from src.expression import compute_displacement, apply_displacement, apply_region_weights
 from src.warp import warp_face
-from src.blend import blend, save_comparison
+from src.blend import blend, save_comparison, color_correct
 from src.align import align_face
 from src.evaluate import compute_metrics, print_metrics, save_metrics_json
 
@@ -199,7 +199,8 @@ def run(source_path, driver_path=None, driver_neutral_path=None, scale=0.7, outp
     # For ETR, compute the target landmarks back in original space
     target_lm_orig = _transform_landmarks(target_lm_aligned, M_src_inv)
 
-    warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement)
+    warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement,
+                                                   lm_cfg=lm_cfg)
 
     # Mouth inner-lip mask (used both for face_mask carve-out and mouth clone gate)
     try:
@@ -282,6 +283,8 @@ def run(source_path, driver_path=None, driver_neutral_path=None, scale=0.7, outp
         if _mouth_open_ratio > 0:
             print(f"[demo] Mouth clone skipped   (open_ratio={_mouth_open_ratio:.3f} < {_CLONE_OPEN_THRESH}  driver mouth closed)")
         result = base_result
+
+    result = color_correct(result, source_img, face_mask)
 
     prefix          = file_prefix or "result"
     result_path     = os.path.join(output_dir, f"{prefix}_result.jpg"   if file_prefix else "result.jpg")
@@ -421,7 +424,8 @@ def _run_one_scale(source_path, driver_path, driver_neutral_path,
     target_lm_aligned = apply_displacement(src_lm_aligned, displacement)
     target_lm_orig    = _transform_landmarks(target_lm_aligned, M_src_inv)
 
-    warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement)
+    warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement,
+                                                   lm_cfg=lm_cfg)
 
     try:
         from src.warp import warp_image_by_landmarks
@@ -476,6 +480,8 @@ def _run_one_scale(source_path, driver_path, driver_neutral_path,
             result = base_result
     else:
         result = base_result
+
+    result = color_correct(result, source_img, fmask)
 
     metrics = compute_metrics(
         source_img         = source_img,
