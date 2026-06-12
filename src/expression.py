@@ -250,6 +250,122 @@ def apply_displacement(landmarks: np.ndarray, displacement: np.ndarray) -> np.nd
     return (landmarks + displacement).astype(np.float32)
 
 
+def _w2(v) -> tuple:
+    """Return (wx, wy) from a scalar float or a (wx, wy) tuple/list."""
+    return tuple(v) if isinstance(v, (tuple, list)) else (float(v), float(v))
+
+
+def apply_region_weights(
+    displacement: np.ndarray,
+    source_lm: np.ndarray,
+    lm_cfg: dict | None = None,
+    *,
+    eye_weight = (0.0, 0.5),
+    nose_weight: float = 0.0,
+    brow_weight: float = 0.75,
+    mouth_weight: float = 1.0,
+    jaw_weight: float = 0.20,
+    outer_weight: float = 0.15,
+    smooth_sigma_ratio: float = 0.25,
+) -> np.ndarray:
+    """
+    Per-region displacement regularisation via Gaussian RBF interpolation.
+
+    Assigns target weights to known facial regions, then smoothly interpolates
+    to all other landmarks so there are no sharp seams in the warp field.
+
+    Each weight can be a scalar (applied to both x and y displacement) or a
+    ``(wx, wy)`` tuple to decouple horizontal and vertical motion independently.
+
+    Default weights
+    ---------------
+    eyes        (0.0, 0.5) — x=0 preserves IOD; y=0.5 allows squinting / widening
+    nose         0.0       — preserves nose proportions and position
+    eyebrows     0.75      — partial expression (brows can raise / furrow)
+    mouth        1.0       — full expression transfer
+    jaw / chin   jaw_weight  — strong regularisation (default 0.20)
+    face oval    outer_weight — strong regularisation along silhouette (default 0.15)
+
+    Smooth transition
+    -----------------
+    sigma = IOD × smooth_sigma_ratio (default ≈ 25 % of inter-ocular distance).
+    Each landmark's weight = Gaussian-weighted average of all seed weights.
+
+    Args:
+        displacement:       (N, 2) from compute_displacement()
+        source_lm:          (N, 2) source landmark positions (aligned space)
+        lm_cfg:             landmark config from get_config(); defaults to MP478
+        eye_weight:         scalar or (wx, wy) for eye-ring landmarks
+                            default (0.0, 0.5): freeze horizontal, allow 50 % vertical
+        nose_weight:        scalar or (wx, wy) for nose bridge/tip/wings (default 0.0)
+        brow_weight:        weight for eyebrow landmarks (default 0.75)
+        mouth_weight:       weight for mouth / inner-lip landmarks (default 1.0)
+        jaw_weight:         weight for jaw/chin arc (default 0.20)
+        outer_weight:       weight for full face-oval perimeter (default 0.15)
+        smooth_sigma_ratio: Gaussian sigma as fraction of IOD (default 0.25)
+
+    Returns:
+        (N, 2) float32 weighted displacement
+    """
+    cfg = lm_cfg or {}
+
+    le       = cfg.get("left_eye",       [33, 160, 158, 133, 153, 144])
+    re       = cfg.get("right_eye",      [362, 385, 387, 263, 373, 380])
+    le_full  = cfg.get("left_eye_full",  le)
+    re_full  = cfg.get("right_eye_full", re)
+    nose     = cfg.get("nose_idx",       [1, 2, 4, 5, 6, 168, 195, 197])
+    brow     = cfg.get("brow_idx",       [70, 63, 105, 66, 107, 336, 296, 334, 293, 300])
+    mouth    = list(set(
+        cfg.get("mouth_idx",     [61, 40, 37, 0, 267, 270, 291, 321, 314, 17, 84, 91])
+        + cfg.get("inner_lip_idx", [78, 191, 80, 13, 308, 402, 14, 88])
+    ))
+    jaw      = cfg.get("jaw_idx",        [234, 93, 132, 58, 172, 136, 150, 149, 152,
+                                           377, 400, 378, 379, 365, 397, 288, 454])
+    oval     = cfg.get("face_oval_idx",  jaw)
+
+    # IOD-based sigma
+    lc    = source_lm[le].mean(0)
+    rc    = source_lm[re].mean(0)
+    iod   = float(np.linalg.norm(rc - lc))
+    sigma = max(iod * smooth_sigma_ratio, 5.0)
+
+    # Build per-axis seed weight lists
+    seed_pts: list = []
+    seed_wx:  list = []
+    seed_wy:  list = []
+    for idx_list, w in [
+        (list(set(le_full + re_full)), eye_weight),
+        (nose,                         nose_weight),
+        (brow,                         brow_weight),
+        (mouth,                        mouth_weight),
+        (jaw,                          jaw_weight),
+        (oval,                         outer_weight),
+    ]:
+        wx, wy = _w2(w)
+        for i in idx_list:
+            seed_pts.append(source_lm[i])
+            seed_wx.append(wx)
+            seed_wy.append(wy)
+
+    seeds = np.array(seed_pts, dtype=np.float32)    # (M, 2)
+    sw_x  = np.array(seed_wx,  dtype=np.float32)   # (M,)
+    sw_y  = np.array(seed_wy,  dtype=np.float32)   # (M,)
+
+    # Gaussian RBF interpolation (shared kernel, separate per-axis weights)
+    diff     = source_lm[:, None, :] - seeds[None, :, :]   # (N, M, 2)
+    dists_sq = (diff ** 2).sum(axis=2)                      # (N, M)
+    gauss    = np.exp(-dists_sq / (2.0 * sigma * sigma))    # (N, M)
+    denom    = gauss.sum(1) + 1e-10                         # (N,)
+
+    w_x = (gauss * sw_x[None, :]).sum(1) / denom  # (N,)
+    w_y = (gauss * sw_y[None, :]).sum(1) / denom  # (N,)
+
+    result = displacement.copy()
+    result[:, 0] *= w_x
+    result[:, 1] *= w_y
+    return result.astype(np.float32)
+
+
 # ── Quick sanity check ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     from src.landmark_config import get_config

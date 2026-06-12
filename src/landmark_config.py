@@ -16,6 +16,10 @@ Each config dict exposes:
   jaw_idx         list[int]     jawline landmarks   (identity-preservation check)
   expr_idx        list[int]     expression-relevant subset (brows + mouth)
   inner_lip_idx   list[int]     inner-lip landmarks (mouth-mask in demo.py)
+  left_eye_full   list[int]     full eyelid ring (for region-warp zero weight)
+  right_eye_full  list[int]     full eyelid ring
+  nose_idx        list[int]     nose bridge, tip, wings (region-warp zero weight)
+  face_oval_idx   list[int]     face perimeter incl. jaw, cheek, forehead
 """
 from __future__ import annotations
 
@@ -36,6 +40,20 @@ MP478: dict = {
                    377, 400, 378, 379, 365, 397, 288, 454],
     # Inner-lip polygon used for mouth-region mask in demo.py
     "inner_lip_idx": [78, 191, 80, 13, 308, 402, 14, 88],
+    # Full eyelid rings (upper + lower lid, tear duct) — for region-warp
+    "left_eye_full" : [33, 7, 163, 144, 145, 153, 154, 155,
+                       133, 173, 157, 158, 159, 160, 161, 246],
+    "right_eye_full": [362, 382, 381, 380, 374, 373, 390, 249,
+                       263, 466, 388, 387, 386, 385, 384, 398],
+    # Nose: bridge, tip, alae, base — preserve proportions
+    "nose_idx"      : [1, 2, 3, 4, 5, 6, 19, 48, 49, 64, 97, 98, 99,
+                       125, 129, 168, 195, 197, 248, 278, 279, 294,
+                       326, 327, 328, 354, 360],
+    # Face oval perimeter (jaw + cheeks + temples + forehead) — from MediaPipe
+    "face_oval_idx" : [10, 338, 297, 332, 284, 251, 389, 356, 454, 323,
+                       361, 288, 397, 365, 379, 378, 400, 377, 152, 148,
+                       176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+                       162, 21, 54, 103, 67, 109],
 }
 # Expression-relevant subset = brows + outer lips + inner lips (30 pts)
 MP478["expr_idx"] = (
@@ -59,6 +77,13 @@ DLIB68: dict = {
     "jaw_idx"   : list(range(0,  17)),   # 0-16   (jawline)
     # Inner-lip polygon: dlib points 60-67
     "inner_lip_idx": list(range(60, 68)),
+    # Full eye rings (same as 6-point clusters for dlib)
+    "left_eye_full" : list(range(36, 42)),
+    "right_eye_full": list(range(42, 48)),
+    # Nose: bridge (27-30) + tip/nostrils (31-35)
+    "nose_idx"      : list(range(27, 36)),
+    # Face perimeter: jawline only (dlib has no separate oval)
+    "face_oval_idx" : list(range(0, 17)),
 }
 # Expression-relevant subset = brows + full mouth (30 pts, same count as MP478)
 DLIB68["expr_idx"] = DLIB68["brow_idx"] + DLIB68["mouth_idx"]

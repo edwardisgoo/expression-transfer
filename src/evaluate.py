@@ -437,7 +437,7 @@ def print_metrics(metrics: dict) -> None:
 
     # ── Image quality ─────────────────────────────────────────────────────────
     print(f"  SSIM  full image   : {metrics['ssim_full']:.4f}"
-          f"   (↑ higher = less overall change)")
+          f"   (^ higher = less overall change)")
     print(f"  SSIM  face region  : {metrics['ssim_face']:.4f}"
           f"   (lower = more expression transferred)")
     print(f"  PSNR  full image   : {metrics['psnr_full_db']:.2f} dB")
@@ -448,24 +448,20 @@ def print_metrics(metrics: dict) -> None:
     else:
         ssim_full = metrics.get("ssim_full", float("nan"))
         if abs(bg - ssim_full) < 1e-4:
-            # Values match — face is small relative to image; background
-            # dominates the full-image SSIM, so both metrics converge.
-            # This is expected behaviour for tight portrait crops where the
-            # face occupies < ~30 % of total pixels.
-            bg_note = "≈ full SSIM (face is small relative to image — normal)"
+            bg_note = "~= full SSIM (face is small relative to image -- normal)"
         elif bg >= 0.98:
-            bg_note = "✓"
+            bg_note = "OK"
         else:
-            bg_note = "↓ warp leaking outside face"
+            bg_note = "v warp leaking outside face"
         print(f"  SSIM  background   : {bg:.4f}   ({bg_note})")
 
     # ── Colour ────────────────────────────────────────────────────────────────
     if isinstance(cd, dict) and "mean" in cd:
         drift_note = ""
         if cd["mean"] > 18:
-            drift_note = "  ← high; partly from expression geometry"
+            drift_note = "  <- high; partly from expression geometry"
         elif cd["mean"] > 12:
-            drift_note = "  ← moderate; expected for strong expressions"
+            drift_note = "  <- moderate; expected for strong expressions"
         print(f"  Color drift face   : {cd['mean']:.2f} px"
               f"  (B={cd['B']:.1f} G={cd['G']:.1f} R={cd['R']:.1f})"
               f"{drift_note}")
@@ -473,19 +469,19 @@ def print_metrics(metrics: dict) -> None:
     # ── Expression transfer ───────────────────────────────────────────────────
     if etr is not None:
         if etr > 1.2:
-            etr_note = "↑ over-shoot — lower scale"
+            etr_note = "^ over-shoot -- lower scale"
         elif etr >= 0.7:
-            etr_note = "✓ good"
+            etr_note = "OK good"
         elif etr >= 0.5:
-            etr_note = "↓ under-transfer — scale may be past pipeline ceiling"
+            etr_note = "v under-transfer -- scale may be past pipeline ceiling"
         else:
-            etr_note = "↓ under-transfer — try driver-neutral or better source"
+            etr_note = "v under-transfer -- try driver-neutral or better source"
         print(f"  ETR transfer ratio : {etr:.3f}   ({etr_note})")
     else:
         print(f"  ETR transfer ratio : N/A  (pass detect_fn to enable)")
 
     if rmse is not None:
-        rmse_note = "✓ close" if rmse < 15 else ("moderate" if rmse < 25 else "↑ far from driver")
+        rmse_note = "OK close" if rmse < 15 else ("moderate" if rmse < 25 else "^ far from driver")
         print(f"  LM RMSE vs driver  : {rmse:.2f} px  ({rmse_note})")
     else:
         print(f"  LM RMSE vs driver  : N/A")
@@ -496,13 +492,13 @@ def print_metrics(metrics: dict) -> None:
     jaw_r   = metrics.get("jaw_rmse")
     if brow_r is not None:
         print(f"  Brow  RMSE         : {brow_r:.2f} px"
-              f"  ({'✓' if brow_r < 8 else '↑ high'})")
+              f"  ({'OK' if brow_r < 8 else '^ high'})")
     if mouth_r is not None:
         print(f"  Mouth RMSE         : {mouth_r:.2f} px"
-              f"  ({'✓' if mouth_r < 8 else '↑ high'})")
+              f"  ({'OK' if mouth_r < 8 else '^ high'})")
     if jaw_r is not None:
-        jaw_note = "✓ identity preserved" if jaw_r < 6 else (
-                   "moderate drift" if jaw_r < 12 else "↑ identity distorted")
+        jaw_note = "OK identity preserved" if jaw_r < 6 else (
+                   "moderate drift" if jaw_r < 12 else "^ identity distorted")
         print(f"  Jaw   RMSE         : {jaw_r:.2f} px  ({jaw_note})")
 
     # ── Blendshape similarity ─────────────────────────────────────────────────
@@ -510,8 +506,8 @@ def print_metrics(metrics: dict) -> None:
     if bs is not None:
         cos  = bs["cosine_sim"]
         mae  = bs["mae"]
-        cos_note = "✓ good" if cos > 0.90 else ("moderate" if cos > 0.75 else "↓ low — expression mismatch")
-        mae_note = "✓" if mae < 0.05 else ("moderate" if mae < 0.10 else "↑ high AU divergence")
+        cos_note = "OK good" if cos > 0.90 else ("moderate" if cos > 0.75 else "v low -- expression mismatch")
+        mae_note = "OK" if mae < 0.05 else ("moderate" if mae < 0.10 else "^ high AU divergence")
         print(f"  Blendshape cosine  : {cos:.3f}   ({cos_note})")
         print(f"  Blendshape MAE     : {mae:.3f}   ({mae_note})")
 
