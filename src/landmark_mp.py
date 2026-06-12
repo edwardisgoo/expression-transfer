@@ -68,33 +68,54 @@ _MP_TO_68 = {
 }
 
 
+# Module-level singleton detectors (keyed by blendshapes flag).
+# Creating a FaceLandmarker loads the ~30 MB model and initialises XNNPACK.
+# Re-doing this for every image in batch mode would be extremely slow, so we
+# cache one instance per mode and reuse it across calls.
+_detector_cache: dict = {}
+
+
+def _get_detector(blendshapes: bool) -> "_mp_vision.FaceLandmarker | None":
+    """Return a cached FaceLandmarker, creating it on first call per mode."""
+    if not _mp_available:
+        return None
+    if blendshapes not in _detector_cache:
+        _ensure_model()
+        options = _mp_vision.FaceLandmarkerOptions(
+            base_options=_mp_python.BaseOptions(
+                model_asset_path=os.path.abspath(_MODEL_PATH)
+            ),
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            output_face_blendshapes=blendshapes,
+        )
+        _detector_cache[blendshapes] = _mp_vision.FaceLandmarker.create_from_options(options)
+    return _detector_cache[blendshapes]
+
+
 def _run_detector(image: np.ndarray, blendshapes: bool = False):
     """
     Run FaceLandmarker and return (landmarks_array, blendshapes_array).
     Either element may be None on detection failure.
     Centralises model setup so both public functions share one code path.
+
+    The underlying FaceLandmarker is cached as a module-level singleton so
+    the model is only loaded once per process (per blendshapes mode).
     """
     if not _mp_available:
         print(f"[landmark_mp] mediapipe not available: {_import_error}")
         return None, None
 
-    _ensure_model()
-
-    base_options = _mp_python.BaseOptions(model_asset_path=os.path.abspath(_MODEL_PATH))
-    options = _mp_vision.FaceLandmarkerOptions(
-        base_options=base_options,
-        num_faces=1,
-        min_face_detection_confidence=0.5,
-        min_face_presence_confidence=0.5,
-        output_face_blendshapes=blendshapes,
-    )
+    detector = _get_detector(blendshapes)
+    if detector is None:
+        return None, None
 
     h, w = image.shape[:2]
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    with _mp_vision.FaceLandmarker.create_from_options(options) as detector:
-        result = detector.detect(mp_image)
+    result = detector.detect(mp_image)
 
     if not result.face_landmarks:
         print("[landmark_mp] Warning: no face detected.")

@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.landmark_config import get_config as _get_lm_config
-from src.expression import compute_displacement, apply_displacement
+from src.expression import compute_displacement, apply_displacement, apply_region_weights
 from src.warp import warp_face
 from src.blend import blend, save_comparison
 from src.align import align_face
@@ -103,8 +103,10 @@ def _build_detector(landmark_mode: str):
         )
 
 
-def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_dir="output",
-        run_eval=True, save_metrics=False, landmark_mode="mp", file_prefix=None):
+def run(source_path, driver_path=None, driver_neutral_path=None, scale=0.7, output_dir="output",
+        run_eval=True, save_metrics=False, landmark_mode="mp", file_prefix=None,
+        atlas_path=None, expr_name=None, region_warp=True,
+        jaw_reg=0.20, outer_reg=0.15):
     os.makedirs(output_dir, exist_ok=True)
 
     # ── Landmark backend ──────────────────────────────────────────────────────
@@ -112,44 +114,84 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
     detect_landmarks, detect_blendshapes = _build_detector(landmark_mode)
     print(f"[landmark] mode = {landmark_mode}  ({lm_cfg['n_points']} points)")
 
+    _atlas_mode = atlas_path is not None and expr_name is not None
+
     print("[1/5] Loading images...")
     source_img = _load_image(source_path)
-    driver_img = _load_image(driver_path)
-    if source_img is None or driver_img is None:
-        print("Error: could not load one or both images.")
+    if source_img is None:
+        print("Error: could not load source image.")
         sys.exit(1)
 
-    if driver_neutral_path:
-        driver_neutral_img = _load_image(driver_neutral_path)
-        if driver_neutral_img is None:
-            print("Error: could not load driver-neutral image.")
-            sys.exit(1)
-    else:
-        print("[!] No driver neutral provided — using direct warp mode.")
-        print("    Source landmarks will be warped directly toward driver face geometry.")
+    if _atlas_mode:
+        driver_img = None
         driver_neutral_img = None
+        print(f"[driver] Atlas mode — expression: '{expr_name}'  ({atlas_path})")
+    else:
+        driver_img = _load_image(driver_path)
+        if driver_img is None:
+            print("Error: could not load driver image.")
+            sys.exit(1)
+        if driver_neutral_path:
+            driver_neutral_img = _load_image(driver_neutral_path)
+            if driver_neutral_img is None:
+                print("Error: could not load driver-neutral image.")
+                sys.exit(1)
+        else:
+            print("[!] No driver neutral provided — using direct warp mode.")
+            print("    Source landmarks will be warped directly toward driver face geometry.")
+            driver_neutral_img = None
 
     print("[2/5] Detecting landmarks...")
     source_lm = detect_landmarks(source_img)
-    driver_lm = detect_landmarks(driver_img)
-    driver_neutral_lm = detect_landmarks(driver_neutral_img) if driver_neutral_img is not None else None
-    driver_bs = detect_blendshapes(driver_img) if detect_blendshapes is not None else None
-
-    if any(lm is None for lm in [source_lm, driver_lm]):
-        print("Error: landmark detection failed on one or more images.")
+    if source_lm is None:
+        print("Error: landmark detection failed on source image.")
         sys.exit(1)
+
+    if _atlas_mode:
+        # Load pre-computed canonical landmarks from atlas (no per-image detection needed)
+        _atlas_data = np.load(atlas_path)
+        _lm_key     = f"{expr_name}_landmarks"
+        _bs_key     = f"{expr_name}_blendshapes"
+        if _lm_key not in _atlas_data.files:
+            available = [k.replace("_landmarks", "") for k in _atlas_data.files
+                         if k.endswith("_landmarks") and not k.endswith("_std")]
+            print(f"Error: expression '{expr_name}' not found in atlas.")
+            print(f"  Available: {available}")
+            sys.exit(1)
+        drv_lm_aligned    = _atlas_data[_lm_key]
+        driver_bs         = _atlas_data[_bs_key] if _bs_key in _atlas_data.files else None
+        driver_neutral_lm = None
+        drv_aligned       = None
+        drvN_lm_aligned   = None
+        print(f"[landmark] Loaded '{expr_name}' from atlas  ({drv_lm_aligned.shape[0]} pts)")
+    else:
+        driver_lm = detect_landmarks(driver_img)
+        if driver_lm is None:
+            print("Error: landmark detection failed on driver image.")
+            sys.exit(1)
+        driver_neutral_lm = detect_landmarks(driver_neutral_img) if driver_neutral_img is not None else None
+        driver_bs = detect_blendshapes(driver_img) if detect_blendshapes is not None else None
 
     print("[3/5] Face alignment (stabilization)...")
     src_aligned, src_lm_aligned, M_src, M_src_inv = align_face(source_img, source_lm, lm_cfg=lm_cfg)
-    drv_aligned, drv_lm_aligned, _, _ = align_face(driver_img, driver_lm, lm_cfg=lm_cfg)
-    if driver_neutral_img is not None and driver_neutral_lm is not None:
-        drvN_aligned, drvN_lm_aligned, _, _ = align_face(driver_neutral_img, driver_neutral_lm, lm_cfg=lm_cfg)
-    else:
-        drvN_aligned = None
-        drvN_lm_aligned = None
+
+    if not _atlas_mode:
+        drv_aligned, drv_lm_aligned, _, _ = align_face(driver_img, driver_lm, lm_cfg=lm_cfg)
+        if driver_neutral_img is not None and driver_neutral_lm is not None:
+            _, drvN_lm_aligned, _, _ = align_face(driver_neutral_img, driver_neutral_lm, lm_cfg=lm_cfg)
+        else:
+            drvN_lm_aligned = None
 
     print("[4/5] Computing displacement & warping in aligned space...")
     displacement = compute_displacement(src_lm_aligned, drv_lm_aligned, drvN_lm_aligned, scale=scale, lm_cfg=lm_cfg)
+
+    if region_warp:
+        displacement = apply_region_weights(
+            displacement, src_lm_aligned, lm_cfg=lm_cfg,
+            jaw_weight=jaw_reg, outer_weight=outer_reg,
+        )
+        print(f"[region-warp] eye=(x=0.00,y=0.50)  nose=0.00  brow=0.75  mouth=1.00  "
+              f"jaw={jaw_reg:.2f}  outer={outer_reg:.2f}")
 
     # target_lm in aligned space
     target_lm_aligned = apply_displacement(src_lm_aligned, displacement)
@@ -159,29 +201,31 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
 
     warped_aligned, face_mask_aligned = warp_face(src_aligned, src_lm_aligned, displacement)
 
-    # Region-aware compositing — mouth handled separately (avoid lip fill)
+    # Mouth inner-lip mask (used both for face_mask carve-out and mouth clone gate)
     try:
-        from src.warp import warp_image_by_landmarks  # type: ignore
-        driver_to_target_aligned = warp_image_by_landmarks(drv_aligned, drv_lm_aligned, target_lm_aligned)
-
-        # Mouth masks (aligned space) — inner-lip indices from landmark config
         inner_poly = target_lm_aligned[lm_cfg["inner_lip_idx"]].astype(np.int32)
         mouth_inner = np.zeros(face_mask_aligned.shape, dtype=np.uint8)
         cv2.fillPoly(mouth_inner, [inner_poly], 255)
-        # Slightly erode inner so we don't overlap lip rim; keep outer in global mask
         k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mouth_inner_eroded = cv2.erode(mouth_inner, k3, iterations=1)
-
-        # Carve ONLY the inner mouth from the global face mask; keep outer lips warped
         face_mask_aligned_nouth = face_mask_aligned.copy()
         inv_inner = cv2.bitwise_not(mouth_inner_eroded)
         face_mask_aligned_nouth = cv2.bitwise_and(face_mask_aligned_nouth, inv_inner)
-
-    except Exception as e:
-        print(f"[demo] Mouth preprocessing error (non-fatal): {e}")
-        driver_to_target_aligned = None
+    except Exception:
         face_mask_aligned_nouth = face_mask_aligned
         mouth_inner = None
+
+    # Region-aware compositing — warp driver image onto target landmarks for mouth clone
+    # (skipped in atlas mode: no driver image available to warp)
+    if not _atlas_mode:
+        try:
+            from src.warp import warp_image_by_landmarks  # type: ignore
+            driver_to_target_aligned = warp_image_by_landmarks(drv_aligned, drv_lm_aligned, target_lm_aligned)
+        except Exception as e:
+            print(f"[demo] Driver warp error (non-fatal): {e}")
+            driver_to_target_aligned = None
+    else:
+        driver_to_target_aligned = None
 
     h, w = source_img.shape[:2]
     warped_img = cv2.warpAffine(warped_aligned, M_src_inv, (w, h),
@@ -218,7 +262,18 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
         if Mmouth["m00"] > 0:
             cx = int(Mmouth["m10"] / Mmouth["m00"])
             cy = int(Mmouth["m01"] / Mmouth["m00"])
-            result = cv2.seamlessClone(driver_to_target_orig, base_result, mouth_mask_orig, (cx, cy), cv2.MIXED_CLONE)
+            # Restrict driver content to a dilated mouth zone only.
+            # driver_to_target_orig contains the entire driver face warped onto
+            # the source — including the driver's chin.  seamlessClone's Poisson
+            # diffusion bleeds gradients outside the mask, so the driver's chin
+            # texture leaks into the source's lower face (double-chin artefact).
+            # Replacing everything outside the dilated mouth region with
+            # base_result pixels gives the solver zero gradient to spread there.
+            _k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            _mouth_zone = cv2.dilate(mouth_mask_orig, _k_dil, iterations=3)
+            _driver_mouth_only = driver_to_target_orig.copy()
+            _driver_mouth_only[_mouth_zone == 0] = base_result[_mouth_zone == 0]
+            result = cv2.seamlessClone(_driver_mouth_only, base_result, mouth_mask_orig, (cx, cy), cv2.MIXED_CLONE)
             print(f"[demo] Mouth clone applied   (open_ratio={_mouth_open_ratio:.3f})")
         else:
             print("[demo] Warning: empty mouth mask — skipping mouth clone")
@@ -232,7 +287,14 @@ def run(source_path, driver_path, driver_neutral_path=None, scale=0.7, output_di
     result_path     = os.path.join(output_dir, f"{prefix}_result.jpg"   if file_prefix else "result.jpg")
     comparison_path = os.path.join(output_dir, f"{prefix}_results.jpg"  if file_prefix else "comparison.jpg")
     cv2.imwrite(result_path, result)
-    save_comparison(source_img, driver_img, result, comparison_path)
+    if _atlas_mode:
+        # No driver image — create a labelled placeholder panel for the comparison
+        _ph = np.full_like(source_img, 200)
+        cv2.putText(_ph, f"Atlas: {expr_name}", (10, _ph.shape[0] // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (50, 50, 200), 2)
+        save_comparison(source_img, _ph, result, comparison_path)
+    else:
+        save_comparison(source_img, driver_img, result, comparison_path)
 
     print(f"\nDone!")
     print(f"  Result:     {result_path}")
@@ -317,7 +379,8 @@ def _score_metrics(metrics: dict) -> float:
 
 
 def _run_one_scale(source_path, driver_path, driver_neutral_path,
-                   scale, landmark_mode):
+                   scale, landmark_mode, region_warp=True,
+                   jaw_reg=0.20, outer_reg=0.15):
     """
     Run expression transfer at a single scale and return
     (result_img, source_img, driver_img, metrics) WITHOUT writing any files.
@@ -350,6 +413,11 @@ def _run_one_scale(source_path, driver_path, driver_neutral_path,
 
     displacement      = compute_displacement(src_lm_aligned, drv_lm_aligned, drvN_lm_aligned,
                                              scale=scale, lm_cfg=lm_cfg)
+    if region_warp:
+        displacement = apply_region_weights(
+            displacement, src_lm_aligned, lm_cfg=lm_cfg,
+            jaw_weight=jaw_reg, outer_weight=outer_reg,
+        )
     target_lm_aligned = apply_displacement(src_lm_aligned, displacement)
     target_lm_orig    = _transform_landmarks(target_lm_aligned, M_src_inv)
 
@@ -398,7 +466,11 @@ def _run_one_scale(source_path, driver_path, driver_neutral_path,
         Mm = cv2.moments(mouth_mask_orig)
         if Mm["m00"] > 0:
             cx, cy = int(Mm["m10"] / Mm["m00"]), int(Mm["m01"] / Mm["m00"])
-            result = cv2.seamlessClone(dtarget_orig, base_result, mouth_mask_orig,
+            _k_dil2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            _mouth_zone2 = cv2.dilate(mouth_mask_orig, _k_dil2, iterations=3)
+            _dtarget_mouth = dtarget_orig.copy()
+            _dtarget_mouth[_mouth_zone2 == 0] = base_result[_mouth_zone2 == 0]
+            result = cv2.seamlessClone(_dtarget_mouth, base_result, mouth_mask_orig,
                                         (cx, cy), cv2.MIXED_CLONE)
         else:
             result = base_result
@@ -421,7 +493,8 @@ def _run_one_scale(source_path, driver_path, driver_neutral_path,
 
 
 def run_scale_search(source_path, driver_dir, driver_neutral_path=None,
-                     scales=None, output_dir="output", landmark_mode="mp"):
+                     scales=None, output_dir="output", landmark_mode="mp",
+                     region_warp=True, jaw_reg=0.20, outer_reg=0.15):
     """
     Scale-search batch mode.
 
@@ -498,6 +571,7 @@ def run_scale_search(source_path, driver_dir, driver_neutral_path=None,
                     result, src_img, drv_img, metrics = _run_one_scale(
                         source_path, img_entry.path, driver_neutral_path,
                         sc, landmark_mode,
+                        region_warp=region_warp, jaw_reg=jaw_reg, outer_reg=outer_reg,
                     )
                     score = _score_metrics(metrics)
                     scale_results.append((sc, score, result, src_img, drv_img, metrics))
@@ -650,7 +724,8 @@ def _aggregate_metrics(metrics_list: list) -> dict:
 
 
 def run_batch(source_path, driver_dir, driver_neutral_path=None, scale=0.7,
-              output_dir="output", run_eval=True, landmark_mode="mp"):
+              output_dir="output", run_eval=True, landmark_mode="mp",
+              region_warp=True, jaw_reg=0.20, outer_reg=0.15):
     """
     Batch mode: driver_dir contains one sub-folder per expression.
     Each sub-folder holds N driver images.
@@ -705,6 +780,9 @@ def run_batch(source_path, driver_dir, driver_neutral_path=None, scale=0.7,
                     save_metrics        = False,
                     landmark_mode       = landmark_mode,
                     file_prefix         = driver_stem,
+                    region_warp         = region_warp,
+                    jaw_reg             = jaw_reg,
+                    outer_reg           = outer_reg,
                 )
                 if metrics is not None:
                     metrics["driver"] = img_entry.name
@@ -730,17 +808,24 @@ def run_batch(source_path, driver_dir, driver_neutral_path=None, scale=0.7,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Facial Expression Transfer Demo")
-    parser.add_argument("--source",         required=True,      help="Source face image (neutral)")
-    parser.add_argument("--driver",         required=True,
+    parser.add_argument("--source",         required=True,  help="Source face image (neutral)")
+    parser.add_argument("--driver",         default=None,
                         help="Driver image OR directory of drivers.  "
-                             "Directory → batch mode (or scale-search with --scale-search).")
-    parser.add_argument("--driver-neutral", default=None,       help="Driver neutral baseline image")
+                             "Directory → batch mode (or scale-search with --scale-search).  "
+                             "Omit when using --atlas.")
+    parser.add_argument("--driver-neutral", default=None,   help="Driver neutral baseline image")
+    # ── Atlas mode (pre-computed expression data) ─────────────────────────────
+    parser.add_argument("--atlas",          default=None,
+                        help="Pre-computed expression atlas .npz built by build_expression_atlas.py")
+    parser.add_argument("--expr",           default=None,
+                        help="Expression name to load from --atlas (e.g. angry, happy)")
+    # ─────────────────────────────────────────────────────────────────────────
     parser.add_argument("--scale",          type=float, default=0.7,
                         help="Expression scale factor for single/batch mode (default: 0.7)")
     parser.add_argument("--landmark-mode",  default="mp", choices=["mp", "dlib"],
                         help="Landmark backend: 'mp' = MediaPipe 478-pt (default), "
                              "'dlib' = dlib 68-pt (lighter, legacy)")
-    parser.add_argument("--output",         default="output",   help="Output directory")
+    parser.add_argument("--output",         default="output",  help="Output directory")
     parser.add_argument("--no-eval",        action="store_true", help="Skip evaluation metrics")
     parser.add_argument("--save-metrics",   action="store_true", help="Save metrics.json (single mode)")
     # ── Scale-search arguments ────────────────────────────────────────────────
@@ -751,9 +836,26 @@ if __name__ == "__main__":
                         default=SEARCH_SCALES,
                         help=f"Scale candidates for --scale-search "
                              f"(default: {SEARCH_SCALES})")
+    # ── Region-warp arguments ─────────────────────────────────────────────────
+    parser.add_argument("--no-region-warp", action="store_true",
+                        help="Disable per-region displacement regularisation (on by default). "
+                             "When off, all landmarks receive identical scale weighting.")
+    parser.add_argument("--jaw-reg",  type=float, default=0.20,
+                        help="Jaw/chin regularisation weight: 0=frozen, 1=full expression "
+                             "(default: 0.20)")
+    parser.add_argument("--outer-reg", type=float, default=0.15,
+                        help="Outer face-oval regularisation weight (default: 0.15)")
     args = parser.parse_args()
 
-    if os.path.isdir(args.driver):
+    # Validate: need either --driver or (--atlas + --expr)
+    if args.driver is None and not (args.atlas and args.expr):
+        parser.error("Provide either --driver <image/dir> or both --atlas <file> and --expr <name>.")
+
+    _region_warp = not args.no_region_warp
+    _jaw_reg     = args.jaw_reg
+    _outer_reg   = args.outer_reg
+
+    if args.driver and os.path.isdir(args.driver):
         if args.scale_search:
             run_scale_search(
                 source_path         = args.source,
@@ -762,6 +864,9 @@ if __name__ == "__main__":
                 scales              = args.scales,
                 output_dir          = args.output,
                 landmark_mode       = args.landmark_mode,
+                region_warp         = _region_warp,
+                jaw_reg             = _jaw_reg,
+                outer_reg           = _outer_reg,
             )
         else:
             run_batch(
@@ -772,10 +877,15 @@ if __name__ == "__main__":
                 output_dir          = args.output,
                 run_eval            = not args.no_eval,
                 landmark_mode       = args.landmark_mode,
+                region_warp         = _region_warp,
+                jaw_reg             = _jaw_reg,
+                outer_reg           = _outer_reg,
             )
     else:
         if args.scale_search:
             print("[!] --scale-search requires --driver to be a directory. Ignored.")
         run(args.source, args.driver, args.driver_neutral, args.scale, args.output,
             run_eval=not args.no_eval, save_metrics=args.save_metrics,
-            landmark_mode=args.landmark_mode)
+            landmark_mode=args.landmark_mode,
+            atlas_path=args.atlas, expr_name=args.expr,
+            region_warp=_region_warp, jaw_reg=_jaw_reg, outer_reg=_outer_reg)
